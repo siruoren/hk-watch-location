@@ -49,6 +49,7 @@ GH_MIRRORS=(
 # 整个代理列表的完整轮次：代理全部失败 → 直连 → 仍失败再来一轮（共 2 轮）
 DOWNLOAD_ROUNDS=2
 SEND_LOG="/tmp/send_hk.log"
+DOCTOR_LOG="/tmp/doctor_hk.log"
 
 c_info()  { printf '\033[1;34m[信息]\033[0m %s\n' "$*"; }
 c_ok()    { printf '\033[1;32m[完成]\033[0m %s\n' "$*"; }
@@ -281,7 +282,7 @@ do_send() {
         c_info "第 ${round} 轮发送会话（${dur} 秒/轮，按 Ctrl+C 随时停止，总上限 ${MAX_TOTAL} 秒）"
         "${BUNDLE_DIR}/.venv/bin/accessory-location" send --transport usb \
             --auth-helper "${BUNDLE_DIR}/accessory-location/tools/local_mfi_v3_helper.py" \
-            --latitude "$lat" --longitude "$lon" --duration "$dur" 2>&1 | tee -a "${SEND_LOG}"
+            --latitude "$lat" --longitude "$lon" --interval 1 --duration "$dur" 2>&1 | tee -a "${SEND_LOG}"
         rc=${PIPESTATUS[0]}
         if [ "$send_running" -eq 1 ] && [ "$rc" -ne 0 ]; then
             c_warn "会话异常退出（代码 ${rc}），5 秒后自动重试下一轮..."
@@ -319,9 +320,65 @@ report() {
     else
         c_warn "无确认包，检查手机端操作"
     fi
+    # 采纳诊断：发送频率受协议 1Hz 上限约束；蓝点仅在手机端应用活跃请求定位时更新
+    local req stp
+    req=$(grep -c '"location_requested"' "${SEND_LOG}" 2>/dev/null || echo 0)
+    stp=$(grep -c '"location_stopped"' "${SEND_LOG}" 2>/dev/null || echo 0)
+    if [ "${stp:-0}" -gt 0 ]; then
+        c_warn "手机端在会话中 ${req} 次请求 / ${stp} 次暂停定位订阅——暂停期间 iOS 不消费坐标"
+        echo "  若地图蓝点未更新，请确认：①获批应用在前台且正在显示地图/蓝点；②定位服务中该应用权限为'使用期间'并开启'精确位置'；③手机已解锁"
+    else
+        c_ok "手机端持续处于定位订阅状态（${req} 次请求，0 次暂停）"
+    fi
     echo
     c_info "测试结束后运行本脚本 stop，并确认设备已恢复真实定位。"
     c_warn "坐标包送达不代表系统或应用采纳，也不代表任何服务资格。"
+}
+
+# ========================= 诊断：获批应用资格/前台状态 =========================
+# 用 probe 会话（只监听不发坐标）检测手机端是否有获批应用在请求定位，并给出针对性结论
+do_doctor() {
+    c_info "运行 20 秒诊断会话（probe 只监听不发坐标），检测手机端定位订阅状态..."
+
+    mkdir -p "${HOME}/.pymobiledevice3"
+    if ! system_profiler SPUSBDataType 2>/dev/null | grep -qi "iphone"; then
+        c_err "未检测到 iPhone，请连接 USB（解锁并信任）后重试"; exit 1
+    fi
+
+    export ACCESSORY_MFI_CERT_FILE="${BUNDLE_DIR}/identity/certificate.p7b"
+    export ACCESSORY_MFI_KEY_FILE="${BUNDLE_DIR}/identity/identity.pk8"
+    export PATH="${BUNDLE_DIR}/.venv/bin:${PATH}"
+
+    cd "${BUNDLE_DIR}/accessory-location"
+    : > "${DOCTOR_LOG}"
+    set +e
+    "${BUNDLE_DIR}/.venv/bin/accessory-location" probe --transport usb \
+        --auth-helper "${BUNDLE_DIR}/accessory-location/tools/local_mfi_v3_helper.py" \
+        --duration 20 2>&1 | tee "${DOCTOR_LOG}"
+    set -e
+
+    echo
+    c_info "诊断结论（获批应用资格 / 前台状态）："
+    if grep -q '"authentication_succeeded"' "${DOCTOR_LOG}" 2>/dev/null; then
+        c_ok "1. MFi 证书认证通过 —— 附件侧资格正常"
+    else
+        c_err "1. 认证失败 —— 检查 identity/ 证书与 USB 连接，此项不过则无从谈起定位"
+        return 1
+    fi
+
+    local req stp
+    req=$(grep -c '"location_requested"' "${DOCTOR_LOG}" 2>/dev/null || echo 0)
+    stp=$(grep -c '"location_stopped"' "${DOCTOR_LOG}" 2>/dev/null || echo 0)
+    if [ "${req:-0}" -gt 0 ] && [ "${stp:-0}" -gt 0 ]; then
+        c_warn "2. 手机端有获批应用但为轮询式请求（${req} 次请求 / ${stp} 次暂停）"
+        echo "   → 前台状态不稳：应用可能切到后台或锁屏。处理：保持该应用前台显示地图蓝点、手机全程解锁、关闭低电量模式"
+    elif [ "${req:-0}" -gt 0 ]; then
+        c_ok "2. 手机端获批应用持续请求定位（${req} 次，无暂停）—— 资格与前台状态正常"
+        echo "   → 此状态下发送坐标，蓝点应更新；若仍不更新，检查该应用定位权限'精确位置'是否开启"
+    else
+        c_err "2. 整个会话手机端从未请求定位 —— 获批应用未在前台运行或无 accessory location 资格"
+        echo "   → 处理：①在 iPhone 上打开获批测试应用并停留在地图页再诊断一次；②设置>隐私与安全性>定位服务：该应用权限'使用期间'+'精确位置'；③定位服务总开关需开启；④若手机上没有可用获批应用，需为该应用申请 accessory location 相关资格后重新安装"
+    fi
 }
 
 # ========================= 主流程 =========================
@@ -329,6 +386,12 @@ main() {
     case "${1:-}" in
         stop)
             do_stop
+            exit 0
+            ;;
+        doctor)
+            bundle_ready || { c_err "主组件包未就绪，请先执行完整流程: $0 run"; exit 1; }
+            [ -x "${BUNDLE_DIR}/.venv/bin/accessory-location" ] || { c_err "依赖未安装，请先执行完整流程: $0 run"; exit 1; }
+            do_doctor
             exit 0
             ;;
         send)
@@ -348,9 +411,10 @@ main() {
             report
             ;;
         *)
-            echo "用法: $0 [run|send|stop] [纬度] [经度]"
+            echo "用法: $0 [run|send|stop|doctor] [纬度] [经度]"
             echo "  run  (默认) 完整流程：环境检查 → 下载组件包 → 离线装依赖 → 持续发送（Ctrl+C 停止）"
             echo "  send        直接持续发送（跳过安装步骤，Ctrl+C 停止）"
+            echo "  doctor      20 秒诊断：检测手机端获批应用的资格与前台状态"
             echo "  stop        停止发送并指导恢复真实定位"
             exit 1
             ;;
