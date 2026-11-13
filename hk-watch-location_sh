@@ -181,20 +181,35 @@ setup_bundle() {
     # --- 本平台 lib 包；网络持续不可用时跳过，由步骤 3 自动在线安装依赖 ---
     if ! ls "${BUNDLE_DIR}/lib/"*.whl >/dev/null 2>&1; then
         local lib_zip="/tmp/${LIB_NAME}"
+        # 本地缓存损坏（如下载中断的半截文件）→ 删除后重新下载
+        if [ -f "$lib_zip" ] && ! unzip -tqq "$lib_zip" >/dev/null 2>&1; then
+            c_warn "本地缓存的 lib 包损坏，删除后重新下载"
+            rm -f "$lib_zip"
+        fi
         if [ ! -f "$lib_zip" ]; then
             c_info "下载本平台 lib 包：${LIB_NAME}（自动检测架构：$(uname -m)）..."
-            if ! fetch "${LIB_URL}" "$lib_zip" 10000000 3600; then
-                c_warn "lib 包下载失败（网络不可用），将改为在线安装依赖"
+            local tries=0
+            while [ "$tries" -lt 2 ]; do
+                if fetch "${LIB_URL}" "$lib_zip" 10000000 3600 \
+                    && unzip -tqq "$lib_zip" >/dev/null 2>&1; then
+                    break
+                fi
+                tries=$((tries + 1))
                 rm -f "$lib_zip"
+                [ "$tries" -lt 2 ] && c_warn "lib 包下载失败或损坏（可能是下载中断），重试（第 2/2 次）..."
+            done
+            if [ ! -f "$lib_zip" ]; then
+                c_warn "lib 包下载失败（网络不可用或持续损坏），将改为在线安装依赖"
                 return 0
             fi
         fi
         c_info "解压 lib 包到 ${BUNDLE_DIR}/lib ..."
         mkdir -p "${BUNDLE_DIR}/lib"
-        unzip -q "$lib_zip" -d "${BUNDLE_DIR}/lib"
+        unzip -q "$lib_zip" -d "${BUNDLE_DIR}/lib" \
+            || { c_warn "lib 包解压异常，将改为在线安装依赖"; rm -rf "${BUNDLE_DIR}/lib"; rm -f "$lib_zip"; return 0; }
         ls "${BUNDLE_DIR}/lib/"*.whl >/dev/null 2>&1 \
             && c_ok "lib 包就绪（$(ls "${BUNDLE_DIR}/lib/"*.whl | wc -l | tr -d ' ') 个 wheel）" \
-            || { c_warn "lib 包解压异常，将改为在线安装依赖"; rm -rf "${BUNDLE_DIR}/lib"; }
+            || { c_warn "lib 包解压异常，将改为在线安装依赖"; rm -rf "${BUNDLE_DIR}/lib"; rm -f "$lib_zip"; }
     fi
 }
 

@@ -243,20 +243,43 @@ function Step-SetupBundle {
     # --- win-amd64 lib 包；网络持续不可用时跳过，由步骤 3 自动在线安装依赖 ---
     if (-not (Test-LibReady)) {
         $libZip = Join-Path $env:TEMP $LibName
+        # 本地缓存损坏（如下载中断的半截文件）→ 删除后重新下载（py zipfile 完整性测试）
+        if (Test-Path $libZip) {
+            py -3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).testzip()" $libZip *> $null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warn2 "本地缓存的 lib 包损坏，删除后重新下载"
+                Remove-Item $libZip -Force -ErrorAction SilentlyContinue
+            }
+        }
         if (-not (Test-Path $libZip)) {
             Write-Info "下载 lib 包：$LibName ..."
-            if (-not (Invoke-Fetch $LibUrl $libZip 10000000 3600)) {
-                Write-Warn2 "lib 包下载失败（网络不可用），将改为在线安装依赖"
+            $ok = $false
+            for ($i = 1; $i -le 2; $i++) {
+                if ((Invoke-Fetch $LibUrl $libZip 10000000 3600)) {
+                    py -3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).testzip()" $libZip *> $null
+                    if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+                }
                 Remove-Item $libZip -Force -ErrorAction SilentlyContinue
+                if ($i -lt 2) { Write-Warn2 "lib 包下载失败或损坏（可能是下载中断），重试（第 2/2 次）..." }
+            }
+            if (-not $ok) {
+                Write-Warn2 "lib 包下载失败（网络不可用或持续损坏），将改为在线安装依赖"
                 return
             }
         }
         Write-Info "解压 lib 包到 $BundleDir\lib ..."
         New-Item (Join-Path $BundleDir "lib") -ItemType Directory -Force | Out-Null
-        Expand-Archive -Path $libZip -DestinationPath (Join-Path $BundleDir "lib") -Force
+        try { Expand-Archive -Path $libZip -DestinationPath (Join-Path $BundleDir "lib") -Force -ErrorAction Stop }
+        catch {
+            Write-Warn2 "lib 包解压异常，将改为在线安装依赖"
+            Remove-Item (Join-Path $BundleDir "lib") -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item $libZip -Force -ErrorAction SilentlyContinue
+            return
+        }
         if (-not (Test-LibReady)) {
             Write-Warn2 "lib 包解压异常，将改为在线安装依赖"
             Remove-Item (Join-Path $BundleDir "lib") -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item $libZip -Force -ErrorAction SilentlyContinue
         }
     }
 }
