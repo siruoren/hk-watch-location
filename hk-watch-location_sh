@@ -309,8 +309,8 @@ report() {
     fi
     # 采纳诊断：发送频率受协议 1Hz 上限约束；蓝点仅在手机端应用活跃请求定位时更新
     local req stp
-    req=$(grep -c '"location_requested"' "${SEND_LOG}" 2>/dev/null || echo 0)
-    stp=$(grep -c '"location_stopped"' "${SEND_LOG}" 2>/dev/null || echo 0)
+    req=$(grep -c '"location_requested"' "${SEND_LOG}" 2>/dev/null || true)
+    stp=$(grep -c '"location_stopped"' "${SEND_LOG}" 2>/dev/null || true)
     if [ "${stp:-0}" -gt 0 ]; then
         c_warn "手机端在会话中 ${req} 次请求 / ${stp} 次暂停定位订阅——暂停期间 iOS 不消费坐标"
         echo "  若地图蓝点未更新，请确认：①获批应用在前台且正在显示地图/蓝点；②定位服务中该应用权限为'使用期间'并开启'精确位置'；③手机已解锁"
@@ -354,8 +354,8 @@ do_doctor() {
     fi
 
     local req stp
-    req=$(grep -c '"location_requested"' "${DOCTOR_LOG}" 2>/dev/null || echo 0)
-    stp=$(grep -c '"location_stopped"' "${DOCTOR_LOG}" 2>/dev/null || echo 0)
+    req=$(grep -c '"location_requested"' "${DOCTOR_LOG}" 2>/dev/null || true)
+    stp=$(grep -c '"location_stopped"' "${DOCTOR_LOG}" 2>/dev/null || true)
     if [ "${req:-0}" -gt 0 ] && [ "${stp:-0}" -gt 0 ]; then
         c_warn "2. 手机端有获批应用但为轮询式请求（${req} 次请求 / ${stp} 次暂停）"
         echo "   → 前台状态不稳：应用可能切到后台或锁屏。处理：保持该应用前台显示地图蓝点、手机全程解锁、关闭低电量模式"
