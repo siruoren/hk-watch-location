@@ -18,7 +18,7 @@ param(
     [Parameter(Position = 0)][string]$Command = "run",
     [Parameter(Position = 1)][double]$Latitude = 22.3193,   # 纬度
     [Parameter(Position = 2)][double]$Longitude = 114.1694, # 经度
-    [int]$Duration = 900                                    # 单轮会话时长（秒）；发送循环执行，直到用户按 Ctrl+C 或到达 30 分钟上限
+    [int]$Duration = 900,                                   # 单轮会话时长（秒）；发送循环执行，直到用户按 Ctrl+C 或到达 30 分钟上限
     [int]$MaxTotal = 1800                                   # 持续发送总时长上限（秒）= 30 分钟，到达后自动终止并输出结果解读
 )
 
@@ -163,7 +163,8 @@ function Invoke-Fetch {
         foreach ($m in $GhMirrors) {
             Write-Info "  代理尝试: $m（单次超时 $TimeoutSec 秒）"
             Remove-Item $Dest -Force -ErrorAction SilentlyContinue
-            curl.exe -sL --connect-timeout 15 --max-time $TimeoutSec --retry 3 --retry-delay 2 -o $Dest "$m$Url"
+            # --ssl-no-revoke：Windows Schannel 证书吊销检查在代理环境下常失败导致 SSL 错误，跳过吊销检查
+            curl.exe -sL --ssl-no-revoke --connect-timeout 15 --max-time $TimeoutSec --retry 3 --retry-delay 2 -o $Dest "$m$Url"
             if ((Test-Path $Dest) -and ((Get-Item $Dest).Length -gt $MinSize)) {
                 $ok = $true
                 Write-Ok "  下载成功 ($((Get-Item $Dest).Length) 字节)"; break
@@ -172,7 +173,7 @@ function Invoke-Fetch {
         if (-not $ok) {
             Write-Warn2 "全部代理失效（超时或失败），回退 GitHub 直连..."
             Remove-Item $Dest -Force -ErrorAction SilentlyContinue
-            curl.exe -sL --connect-timeout 15 --max-time $TimeoutSec --retry 3 --retry-delay 2 -o $Dest $Url
+            curl.exe -sL --ssl-no-revoke --connect-timeout 15 --max-time $TimeoutSec --retry 3 --retry-delay 2 -o $Dest $Url
             if ((Test-Path $Dest) -and ((Get-Item $Dest).Length -gt $MinSize)) {
                 $ok = $true
                 Write-Ok "  直连下载成功 ($((Get-Item $Dest).Length) 字节)"
