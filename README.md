@@ -2,7 +2,7 @@
 
 accessory-location 的 iPhone USB/iAP2 定位数据传输测试。
 
-执行脚本会自动下载组件包并按 CPU 架构选择对应的 lib 包（主包含 `accessory-location` 脚本与源码、`identity` MFi 证书；lib 包按平台独立打包），校验 SHA-256 后解压，并从 `lib/` 离线安装依赖，无需再克隆仓库或解析 APK。
+执行脚本会自动下载组件包并按 CPU 架构选择对应的 lib 包（主包含 `accessory-location` 脚本与源码、`identity` MFi 证书；lib 包按平台独立打包），校验 SHA-256 后解压，并从 `lib/` 离线安装依赖。
 
 ## 用法
 
