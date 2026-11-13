@@ -18,7 +18,8 @@ set -euo pipefail
 # ========================= 可配置参数 =========================
 DEFAULT_LAT=22.3193          # 纬度
 DEFAULT_LON=114.1694         # 经度
-DURATION=900                 # 单轮会话时长（秒）；发送循环执行，直到用户按 Ctrl+C 手动停止
+DURATION=900                 # 单轮会话时长（秒）；发送循环执行，直到用户按 Ctrl+C 或到达 30 分钟上限
+MAX_TOTAL=1800               # 持续发送总时长上限（秒）= 30 分钟，到达后自动终止并输出结果解读
 # 组件包：主包（accessory-location 脚本/源码 + identity MFi 证书）
 #          + 按平台独立的 lib 包（依赖 wheel），脚本按 CPU 架构自动选择
 BUNDLE_DIR="/tmp/hk-watch-location-bundle"
@@ -265,15 +266,22 @@ do_send() {
     c_warn "请仅在获批的测试应用中触发定位请求；不要用于改变真实位置或获取受限服务资格"
     echo "-----------------------------------------------------------"
 
-    # 持续运行：每轮 DURATION 秒，轮与轮无缝衔接，直到用户按 Ctrl+C 手动停止
+    # 持续运行：每轮 DURATION 秒（末轮自动缩短以不超上限），轮与轮无缝衔接；
+    # 用户按 Ctrl+C 手动停止，或累计达 MAX_TOTAL（30 分钟）自动终止
     set +e
     trap 'c_warn "收到停止信号，结束持续发送..."; send_running=0' INT TERM
     local round=1 send_running=1 rc=0
+    local start=$SECONDS elapsed=0 dur
     while [ "$send_running" -eq 1 ]; do
-        c_info "第 ${round} 轮发送会话（${DURATION} 秒/轮，按 Ctrl+C 随时停止）"
+        elapsed=$((SECONDS - start))
+        [ "$elapsed" -ge "$MAX_TOTAL" ] && break
+        # 末轮时长取剩余时间，保证总时长不超过 30 分钟
+        dur=$DURATION
+        [ "$((elapsed + DURATION))" -gt "$MAX_TOTAL" ] && dur=$((MAX_TOTAL - elapsed))
+        c_info "第 ${round} 轮发送会话（${dur} 秒/轮，按 Ctrl+C 随时停止，总上限 ${MAX_TOTAL} 秒）"
         "${BUNDLE_DIR}/.venv/bin/accessory-location" send --transport usb \
             --auth-helper "${BUNDLE_DIR}/accessory-location/tools/local_mfi_v3_helper.py" \
-            --latitude "$lat" --longitude "$lon" --duration "$DURATION" 2>&1 | tee -a "${SEND_LOG}"
+            --latitude "$lat" --longitude "$lon" --duration "$dur" 2>&1 | tee -a "${SEND_LOG}"
         rc=${PIPESTATUS[0]}
         if [ "$send_running" -eq 1 ] && [ "$rc" -ne 0 ]; then
             c_warn "会话异常退出（代码 ${rc}），5 秒后自动重试下一轮..."
@@ -283,7 +291,11 @@ do_send() {
     done
     trap - INT TERM
     set -e
-    c_ok "发送已手动停止（共完成 ${round} 轮，日志：${SEND_LOG}）"
+    if [ "$send_running" -eq 0 ]; then
+        c_ok "发送已手动停止（共完成 ${round} 轮，日志：${SEND_LOG}）"
+    else
+        c_ok "持续发送已达 ${MAX_TOTAL} 秒（30 分钟）上限，自动终止（共 ${round} 轮，日志：${SEND_LOG}）"
+    fi
 }
 
 # ========================= 步骤 5：结果解读 =========================

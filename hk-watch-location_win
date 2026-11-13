@@ -18,7 +18,8 @@ param(
     [Parameter(Position = 0)][string]$Command = "run",
     [Parameter(Position = 1)][double]$Latitude = 22.3193,   # 纬度
     [Parameter(Position = 2)][double]$Longitude = 114.1694, # 经度
-    [int]$Duration = 900                                    # 单轮会话时长（秒）；发送循环执行，直到用户按 Ctrl+C 手动停止
+    [int]$Duration = 900                                    # 单轮会话时长（秒）；发送循环执行，直到用户按 Ctrl+C 或到达 30 分钟上限
+    [int]$MaxTotal = 1800                                   # 持续发送总时长上限（秒）= 30 分钟，到达后自动终止并输出结果解读
 )
 
 # ========================= 可配置参数 =========================
@@ -319,20 +320,33 @@ function Invoke-Send {
 
     Push-Location (Join-Path $BundleDir "accessory-location")
     try {
-        # 持续运行：每轮 $Duration 秒，轮与轮无缝衔接，直到用户按 Ctrl+C 手动停止
-        # Ctrl+C 结束会话后 accessory-location 以非零码退出，据此终止循环（finally 仍会执行结果解读）
+        # 持续运行：每轮 $Duration 秒（末轮自动缩短以不超上限），轮与轮无缝衔接；
+        # 用户按 Ctrl+C 手动停止（非零退出码），或累计达 $MaxTotal（30 分钟）自动终止
         Set-Content -Path $SendLog -Value $null   # 每次执行重建日志（多轮 Tee-Object -Append 累加）
         $round = 1
-        while ($true) {
-            Write-Info "第 $round 轮发送会话（$Duration 秒/轮，按 Ctrl+C 随时停止）"
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt $MaxTotal) {
+            # 末轮时长取剩余时间，保证总时长不超过 30 分钟
+            $dur = $Duration
+            $remain = [int]($MaxTotal - $sw.Elapsed.TotalSeconds)
+            if ($remain -lt $dur) { $dur = $remain }
+            Write-Info "第 $round 轮发送会话（$dur 秒/轮，按 Ctrl+C 随时停止，总上限 $MaxTotal 秒）"
             & (Join-Path $BundleDir ".venv\Scripts\accessory-location.exe") send --transport usb `
                 --auth-helper $shim `
-                --latitude $Latitude --longitude $Longitude --duration $Duration 2>&1 |
+                --latitude $Latitude --longitude $Longitude --duration $dur 2>&1 |
                 Tee-Object -FilePath $SendLog -Append
-            if ($LASTEXITCODE -ne 0) { break }
+            if ($LASTEXITCODE -eq -1073741510) { break }   # -1073741510 = STATUS_CONTROL_C_EXIT，用户按 Ctrl+C 停止
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warn2 "会话异常退出（代码 $LASTEXITCODE），5 秒后自动重试下一轮..."
+                Start-Sleep -Seconds 5
+            }
             $round++
         }
-        Write-Ok "发送已手动停止（共完成 $round 轮，日志：$SendLog）"
+        if ($sw.Elapsed.TotalSeconds -ge $MaxTotal) {
+            Write-Ok "持续发送已达 $MaxTotal 秒（30 分钟）上限，自动终止（共 $round 轮，日志：$SendLog）"
+        } else {
+            Write-Ok "发送已手动停止（共完成 $round 轮，日志：$SendLog）"
+        }
     } finally { Pop-Location }
 }
 
