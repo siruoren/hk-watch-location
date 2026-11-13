@@ -103,29 +103,54 @@ check_env() {
 
 # ========================= 步骤 2：下载组件包 =========================
 # 通用下载：fetch <URL> <目标文件> <最小字节数> [超时秒数，默认900，lib包传3600=1小时]
-# 每轮先遍历全部代理，单个代理超时/失败自动换下一个；代理全部失效后回退 GitHub 直连；
-# 仍失败再来一轮，共 DOWNLOAD_ROUNDS 轮；全部失败返回 1，由调用方决定降级（如在线安装）
+# 流程：先用每个代理做 10 秒测速（拉取前 256KB），10 秒内通过才参与下载，未通过自动换下一个；
+#       通过测速的代理依次带实时百分比进度下载；全部失效回退 GitHub 直连（同样带进度）；
+#       仍失败再来一轮，共 DOWNLOAD_ROUNDS 轮；全部失败返回 1，由调用方决定降级（如在线安装）
+PROBE_TIMEOUT=10      # 代理测速限时（秒）
+PROBE_BYTES=262144    # 测速拉取的前缀字节数（256KB）
+
+# dl <URL> <目标文件> <最小字节数> <超时秒数>：带实时百分比进度下载（curl -# 进度条）
+dl() {
+    rm -f "$2"
+    curl -L --progress-bar --connect-timeout 15 --max-time "$4" --retry 3 --retry-delay 2 \
+         -o "$2" -H "User-Agent: hk-watch-location" "$1" 2>&1 | tr '\r' '\n' | tail -1
+    [ -f "$2" ] && [ "$(stat -f%z "$2" 2>/dev/null || echo 0)" -gt "$3" ]
+}
+
 fetch() {
-    local url="$1" dest="$2" min_size="$3" timeout="${4:-900}" ok=1 round
+    local url="$1" dest="$2" min_size="$3" timeout="${4:-900}" ok=1 round m
     for round in $(seq 1 "${DOWNLOAD_ROUNDS}"); do
         [ "$round" -gt 1 ] && c_warn "上一轮下载全部失败，开始第 ${round} 轮重试..."
+        # 阶段 1：代理测速——10 秒内拉不到前 256KB 的代理直接跳过
+        local -a fast_proxies=()
         for m in "${GH_MIRRORS[@]}"; do
-            c_info "  代理尝试: ${m}（单次超时 ${timeout} 秒）"
-            rm -f "$dest"
-            if curl -sL --connect-timeout 15 --max-time "$timeout" --retry 3 --retry-delay 2 \
-                 -o "$dest" -H "User-Agent: hk-watch-location" \
-                 "${m}${url}" \
-               && [ "$(stat -f%z "$dest")" -gt "$min_size" ]; then
-                ok=0; c_ok "  下载成功 ($(stat -f%z "$dest") 字节)"; break
+            c_info "  测速代理: ${m}（${PROBE_TIMEOUT} 秒内需拉取前 ${PROBE_BYTES} 字节）"
+            local code
+            code=$(curl -sL --connect-timeout 5 --max-time "$PROBE_TIMEOUT" \
+                        -r "0-$((PROBE_BYTES - 1))" -o /dev/null -w '%{http_code}' \
+                        -H "User-Agent: hk-watch-location" "${m}${url}" 2>/dev/null || echo 000)
+            if [ "$code" = "200" ] || [ "$code" = "206" ]; then
+                c_ok "  测速通过: ${m}"
+                fast_proxies+=("$m")
+            else
+                c_warn "  测速未通过（${PROBE_TIMEOUT} 秒内未完成），跳过: ${m}"
             fi
         done
+        # 阶段 2：用通过测速的代理依次下载（带实时百分比进度）；macOS bash 3.2 下空数组展开会
+        # 触发 set -u 的 unbound variable，故先判空
+        if [ "${#fast_proxies[@]}" -gt 0 ]; then
+            for m in "${fast_proxies[@]}"; do
+                c_info "  代理下载: ${m}"
+                if dl "${m}${url}" "$dest" "$min_size" "$timeout"; then
+                    ok=0; c_ok "  下载成功 ($(stat -f%z "$dest") 字节)"; break
+                fi
+                c_warn "  该代理下载失败，换下一个..."
+            done
+        fi
+        # 阶段 3：全部失效 → GitHub 直连（带实时百分比进度）
         if [ "$ok" -ne 0 ]; then
-            c_warn "全部代理失效（超时或失败），回退 GitHub 直连..."
-            rm -f "$dest"
-            if curl -sL --connect-timeout 15 --max-time "$timeout" --retry 3 --retry-delay 2 \
-                 -o "$dest" -H "User-Agent: hk-watch-location" \
-                 "${url}" \
-               && [ "$(stat -f%z "$dest")" -gt "$min_size" ]; then
+            c_warn "全部可用代理失效（测速未通过或下载失败），回退 GitHub 直连..."
+            if dl "$url" "$dest" "$min_size" "$timeout"; then
                 ok=0; c_ok "  直连下载成功 ($(stat -f%z "$dest") 字节)"
             fi
         fi
@@ -152,19 +177,38 @@ setup_bundle() {
         return
     fi
 
-    # --- 主包（脚本 + 证书），下载失败则无法继续 ---
+    # --- 主包（脚本 + 证书），下载失败则无法继续；下载/解压失败自动清理重下，最多 10 次 ---
     if ! bundle_ready; then
         local bundle_zip="/tmp/hk-watch-location-bundle.zip"
-        if [ ! -f "$bundle_zip" ]; then
-            c_info "下载主组件包（脚本 + 证书）..."
-            fetch "${BUNDLE_URL}" "$bundle_zip" 50000 || { rm -f "$bundle_zip"; exit 1; }
-        fi
-        c_info "解压主组件包到 ${BUNDLE_DIR} ..."
-        mkdir -p "${BUNDLE_DIR}"
-        unzip -q "$bundle_zip" -d "${BUNDLE_DIR}" \
-            || { c_err "解压失败：组件包损坏，请删除 ${bundle_zip} 后重试"; rm -rf "${BUNDLE_DIR}"; exit 1; }
-        bundle_ready || { c_err "主组件包解压后不完整（缺 accessory-location / identity）"; exit 1; }
-        c_ok "主组件包就绪：${BUNDLE_DIR}（证书已随包提供，无需再解析 APK）"
+        local btry=0
+        while [ "$btry" -lt 10 ]; do
+            btry=$((btry + 1))
+            # 本地缓存损坏（下载中断的半截文件或代理返回的错误页）→ 删除重下
+            if [ -f "$bundle_zip" ] && ! unzip -tqq "$bundle_zip" </dev/null >/dev/null 2>&1; then
+                c_warn "本地缓存的主包损坏，删除后重新下载"
+                rm -f "$bundle_zip"
+            fi
+            if [ ! -f "$bundle_zip" ]; then
+                c_info "下载主组件包（脚本 + 证书）...（第 $btry/10 次）"
+                if ! fetch "${BUNDLE_URL}" "$bundle_zip" 50000 \
+                    || ! unzip -tqq "$bundle_zip" </dev/null >/dev/null 2>&1; then
+                    rm -f "$bundle_zip"
+                    if [ "$btry" -lt 10 ]; then c_warn "主包下载失败或损坏，自动重试..."; continue; fi
+                fi
+            fi
+            [ -f "$bundle_zip" ] || break
+            c_info "解压主组件包到 ${BUNDLE_DIR} ..."
+            mkdir -p "${BUNDLE_DIR}"
+            if unzip -q "$bundle_zip" -d "${BUNDLE_DIR}" 2>/dev/null && bundle_ready; then
+                c_ok "主组件包就绪：${BUNDLE_DIR}（证书已随包提供，无需再解析 APK）"
+                break
+            fi
+            rm -rf "${BUNDLE_DIR}"; rm -f "$bundle_zip"
+            if [ "$btry" -lt 10 ]; then
+                c_warn "主包解压失败或内容不完整（可能是下载损坏），已清理，自动重新下载（第 $btry/10 次）..."
+            fi
+        done
+        bundle_ready || { c_err "主组件包连续 10 次下载/解压均失败；请检查网络/代理，并确认 Release 资产为无密码 zip 后重试"; exit 1; }
     else
         c_ok "主组件包已存在：${BUNDLE_DIR}"
     fi
@@ -173,7 +217,7 @@ setup_bundle() {
     if ! ls "${BUNDLE_DIR}/lib/"*.whl >/dev/null 2>&1; then
         local lib_zip="/tmp/${LIB_NAME}"
         # 本地缓存损坏（如下载中断的半截文件）→ 删除后重新下载
-        if [ -f "$lib_zip" ] && ! unzip -tqq "$lib_zip" >/dev/null 2>&1; then
+        if [ -f "$lib_zip" ] && ! unzip -tqq "$lib_zip" </dev/null >/dev/null 2>&1; then
             c_warn "本地缓存的 lib 包损坏，删除后重新下载"
             rm -f "$lib_zip"
         fi
@@ -182,7 +226,7 @@ setup_bundle() {
             local tries=0
             while [ "$tries" -lt 2 ]; do
                 if fetch "${LIB_URL}" "$lib_zip" 10000000 3600 \
-                    && unzip -tqq "$lib_zip" >/dev/null 2>&1; then
+                    && unzip -tqq "$lib_zip" </dev/null >/dev/null 2>&1; then
                     break
                 fi
                 tries=$((tries + 1))

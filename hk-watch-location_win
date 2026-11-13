@@ -153,28 +153,53 @@ function Step-CheckEnv {
 
 # ========================= 步骤 2：下载组件包 =========================
 # 通用下载：Invoke-Fetch <URL> <目标文件> <最小字节数> [超时秒数，默认900，lib包传3600=1小时]
-# 每轮先遍历全部代理，单个代理超时/失败自动换下一个；代理全部失效后回退 GitHub 直连；
-# 仍失败再来一轮，共 $DownloadRounds 轮；全部失败返回 $false，由调用方决定降级（如在线安装）
+# 流程：先用每个代理做 10 秒测速（拉取前 256KB），10 秒内通过才参与下载，未通过自动换下一个；
+#       通过测速的代理依次带实时百分比进度下载；全部失效回退 GitHub 直连（同样带进度）；
+#       仍失败再来一轮，共 $DownloadRounds 轮；全部失败返回 $false，由调用方决定降级（如在线安装）
+$ProbeTimeout = 10      # 代理测速限时（秒）
+$ProbeBytes   = 262144  # 测速拉取的前缀字节数（256KB）
+
+# Invoke-Dl：带实时百分比进度下载（curl -# 进度条）
+function Invoke-Dl {
+    param([string]$Url, [string]$Dest, [long]$MinSize, [int]$TimeoutSec)
+    Remove-Item $Dest -Force -ErrorAction SilentlyContinue
+    # --ssl-no-revoke：Windows Schannel 证书吊销检查在代理环境下常失败导致 SSL 错误，跳过吊销检查
+    curl.exe -L --progress-bar --ssl-no-revoke --connect-timeout 15 --max-time $TimeoutSec --retry 3 --retry-delay 2 -o $Dest -H "User-Agent: hk-watch-location" $Url
+    if ((Test-Path $Dest) -and ((Get-Item $Dest -ErrorAction SilentlyContinue).Length -gt $MinSize)) { return $true }
+    return $false
+}
+
 function Invoke-Fetch {
     param([string]$Url, [string]$Dest, [long]$MinSize, [int]$TimeoutSec = 900)
     $ok = $false
     for ($round = 1; $round -le $DownloadRounds; $round++) {
         if ($round -gt 1) { Write-Warn2 "上一轮下载全部失败，开始第 $round 轮重试..." }
+        # 阶段 1：代理测速——10 秒内拉不到前 256KB 的代理直接跳过
+        $fastProxies = @()
         foreach ($m in $GhMirrors) {
-            Write-Info "  代理尝试: $m（单次超时 $TimeoutSec 秒）"
-            Remove-Item $Dest -Force -ErrorAction SilentlyContinue
-            # --ssl-no-revoke：Windows Schannel 证书吊销检查在代理环境下常失败导致 SSL 错误，跳过吊销检查
-            curl.exe -sL --ssl-no-revoke --connect-timeout 15 --max-time $TimeoutSec --retry 3 --retry-delay 2 -o $Dest "$m$Url"
-            if ((Test-Path $Dest) -and ((Get-Item $Dest).Length -gt $MinSize)) {
+            Write-Info "  测速代理: $m（$ProbeTimeout 秒内需拉取前 $ProbeBytes 字节）"
+            $code = (& curl.exe -sL --ssl-no-revoke --connect-timeout 5 --max-time $ProbeTimeout -r "0-$($ProbeBytes - 1)" -o NUL -w "%{http_code}" "$m$Url") 2>$null
+            $code = "$code".Trim()
+            if ($code -eq "200" -or $code -eq "206") {
+                Write-Ok "  测速通过: $m"
+                $fastProxies += $m
+            } else {
+                Write-Warn2 "  测速未通过（$ProbeTimeout 秒内未完成），跳过: $m"
+            }
+        }
+        # 阶段 2：用通过测速的代理依次下载（带实时百分比进度）
+        foreach ($m in $fastProxies) {
+            Write-Info "  代理下载: $m"
+            if (Invoke-Dl -Url "$m$Url" -Dest $Dest -MinSize $MinSize -TimeoutSec $TimeoutSec) {
                 $ok = $true
                 Write-Ok "  下载成功 ($((Get-Item $Dest).Length) 字节)"; break
             }
+            Write-Warn2 "  该代理下载失败，换下一个..."
         }
+        # 阶段 3：全部失效 → GitHub 直连（带实时百分比进度）
         if (-not $ok) {
-            Write-Warn2 "全部代理失效（超时或失败），回退 GitHub 直连..."
-            Remove-Item $Dest -Force -ErrorAction SilentlyContinue
-            curl.exe -sL --ssl-no-revoke --connect-timeout 15 --max-time $TimeoutSec --retry 3 --retry-delay 2 -o $Dest $Url
-            if ((Test-Path $Dest) -and ((Get-Item $Dest).Length -gt $MinSize)) {
+            Write-Warn2 "全部可用代理失效（测速未通过或下载失败），回退 GitHub 直连..."
+            if (Invoke-Dl -Url $Url -Dest $Dest -MinSize $MinSize -TimeoutSec $TimeoutSec) {
                 $ok = $true
                 Write-Ok "  直连下载成功 ($((Get-Item $Dest).Length) 字节)"
             }
@@ -207,26 +232,39 @@ function Step-SetupBundle {
         Write-Ok "组件包与依赖已就绪：$BundleDir"; return
     }
 
-    # --- 主包（脚本 + 证书），下载失败则无法继续 ---
+    # --- 主包（脚本 + 证书），下载失败则无法继续；下载/解压失败自动清理重下，最多 10 次 ---
     if (-not (Test-BundleReady)) {
         $bundleZip = Join-Path $env:TEMP "hk-watch-location-bundle.zip"
-        if (-not (Test-Path $bundleZip)) {
-            Write-Info "下载主组件包（脚本 + 证书）..."
-            if (-not (Invoke-Fetch $BundleUrl $bundleZip 50000)) {
-                Remove-Item $bundleZip -Force -ErrorAction SilentlyContinue
-                Write-Err2 "主组件包下载失败，请检查网络或手动下载 $BundleUrl 后重试"; exit 1
+        $ok = $false
+        for ($btry = 1; $btry -le 10; $btry++) {
+            # 本地缓存损坏（下载中断的半截文件或代理返回的错误页）→ 删除重下
+            if (Test-Path $bundleZip) {
+                py -3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).testzip()" $bundleZip *> $null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warn2 "本地缓存的主包损坏，删除后重新下载"
+                    Remove-Item $bundleZip -Force -ErrorAction SilentlyContinue
+                }
             }
+            if (-not (Test-Path $bundleZip)) {
+                Write-Info "下载主组件包（脚本 + 证书）...（第 $btry/10 次）"
+                Invoke-Fetch $BundleUrl $bundleZip 50000 | Out-Null
+                py -3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).testzip()" $bundleZip *> $null
+                if (-not (Test-Path $bundleZip) -or $LASTEXITCODE -ne 0) {
+                    Remove-Item $bundleZip -Force -ErrorAction SilentlyContinue
+                    if ($btry -lt 10) { Write-Warn2 "主包下载失败或损坏，自动重试..." }
+                    continue
+                }
+            }
+            Write-Info "解压主组件包到 $BundleDir ..."
+            New-Item $BundleDir -ItemType Directory -Force | Out-Null
+            try { Expand-Archive -Path $bundleZip -DestinationPath $BundleDir -Force -ErrorAction Stop }
+            catch { Remove-Item $BundleDir -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-BundleReady) { $ok = $true; break }
+            Remove-Item $BundleDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item $bundleZip -Force -ErrorAction SilentlyContinue
+            if ($btry -lt 10) { Write-Warn2 "主包解压失败或内容不完整（可能是下载损坏），已清理，自动重新下载（第 $btry/10 次）..." }
         }
-        Write-Info "解压主组件包到 $BundleDir ..."
-        New-Item $BundleDir -ItemType Directory -Force | Out-Null
-        try { Expand-Archive -Path $bundleZip -DestinationPath $BundleDir -Force -ErrorAction Stop }
-        catch {
-            Write-Err2 "解压失败：组件包损坏，请删除 $bundleZip 后重试"
-            Remove-Item $BundleDir -Recurse -Force -ErrorAction SilentlyContinue; exit 1
-        }
-        if (-not (Test-BundleReady)) {
-            Write-Err2 "主组件包解压后不完整（缺 accessory-location / identity）"; exit 1
-        }
+        if (-not $ok) { Write-Err2 "主组件包连续 10 次下载/解压均失败；请检查网络/代理，并确认 Release 资产为无密码 zip 后重试"; exit 1 }
         Write-Ok "主组件包就绪：$BundleDir（证书已随包提供，无需再解析 APK）"
     } else { Write-Ok "主组件包已存在：$BundleDir" }
 
