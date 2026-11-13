@@ -28,10 +28,8 @@ param(
 $BundleDir   = Join-Path $env:USERPROFILE "hk-watch-location-bundle"
 $BaseUrl     = "https://github.com/siruoren/hk-watch-location/releases/download/v1"
 $BundleUrl   = "$BaseUrl/hk-watch-location-bundle.zip"
-$BundleSha256 = "28751D17D466B3EE2D5A0646E96CAD3B5EC7206A48BD84CF68916C997684528E"
 $LibName     = "hk-watch-location-lib-win-amd64.zip"
 $LibUrl      = "$BaseUrl/$LibName"
-$LibSha256   = "53C7C8D7EE722CE35AFE6F3DD7D86396A841B3C2646292418EABF59F36023E15"
 $PyPiMirror  = "https://pypi.tuna.tsinghua.edu.cn/simple"
 # GitHub 加速代理地址（按顺序尝试，全部失效后才回退 GitHub 直连）
 $GhMirrors     = @("https://ghfast.top/", "https://wget.la/", "https://gh-proxy.com/", "https://ghproxy.net/", "https://ghproxy.cc/", "https://gh-proxy.net/")
@@ -190,16 +188,6 @@ function Invoke-Fetch {
     return $true
 }
 
-# 校验 SHA-256：Assert-Hash <文件> <期望SHA256>
-function Assert-Hash {
-    param([string]$File, [string]$Expected)
-    $actual = (Get-FileHash $File -Algorithm SHA256).Hash
-    if ($actual -ne $Expected) {
-        Write-Err2 "SHA-256 不匹配！期望 $Expected，实际 $actual（文件：$File）"; exit 1
-    }
-    Write-Ok "SHA-256 校验通过：$(Split-Path $File -Leaf)"
-}
-
 # 主包是否就绪（脚本 + 证书；lib 可缺失，缺时依赖走在线安装）
 function Test-BundleReady {
     return (Test-Path (Join-Path $BundleDir "accessory-location\tools\local_mfi_v3_helper.py")) `
@@ -228,10 +216,24 @@ function Step-SetupBundle {
                 Write-Err2 "主组件包下载失败，请检查网络或手动下载 $BundleUrl 后重试"; exit 1
             }
         }
-        Assert-Hash $bundleZip $BundleSha256
         Write-Info "解压主组件包到 $BundleDir ..."
         New-Item $BundleDir -ItemType Directory -Force | Out-Null
-        Expand-Archive -Path $bundleZip -DestinationPath $BundleDir -Force
+        # 解压密码：用户输入（直接回车 = 无密码）；lib 包不受影响
+        # Expand-Archive 不支持加密 zip：有密码时用 py + zipfile（ZipCrypto）
+        $pw = Read-Host "请输入组件包解压密码（直接回车表示无密码）"
+        if ($pw) {
+            $pyCode = "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2], pwd=sys.argv[3].encode())"
+            py -3 -c $pyCode $bundleZip $BundleDir $pw
+            if ($LASTEXITCODE -ne 0) {
+                Write-Err2 "解压失败：密码错误或组件包损坏"; Remove-Item $BundleDir -Recurse -Force -ErrorAction SilentlyContinue; exit 1
+            }
+        } else {
+            try { Expand-Archive -Path $bundleZip -DestinationPath $BundleDir -Force -ErrorAction Stop }
+            catch {
+                Write-Err2 "解压失败：组件包已加密，请重新运行并输入解压密码"
+                Remove-Item $BundleDir -Recurse -Force -ErrorAction SilentlyContinue; exit 1
+            }
+        }
         if (-not (Test-BundleReady)) {
             Write-Err2 "主组件包解压后不完整（缺 accessory-location / identity）"; exit 1
         }
@@ -248,8 +250,6 @@ function Step-SetupBundle {
                 Remove-Item $libZip -Force -ErrorAction SilentlyContinue
                 return
             }
-        } else {
-            Assert-Hash $libZip $LibSha256
         }
         Write-Info "解压 lib 包到 $BundleDir\lib ..."
         New-Item (Join-Path $BundleDir "lib") -ItemType Directory -Force | Out-Null

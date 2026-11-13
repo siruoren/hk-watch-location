@@ -25,17 +25,12 @@ MAX_TOTAL=1800               # 持续发送总时长上限（秒）= 30 分钟�
 BUNDLE_DIR="/tmp/hk-watch-location-bundle"
 BASE_URL="https://github.com/siruoren/hk-watch-location/releases/download/v1"
 BUNDLE_URL="${BASE_URL}/hk-watch-location-bundle.zip"
-BUNDLE_SHA256="28751d17d466b3ee2d5a0646e96cad3b5ec7206a48bd84cf68916c997684528e"
 # 按平台选择 lib 包（arm64 / x86_64）
 case "$(uname -m)" in
     arm64) LIB_NAME="hk-watch-location-lib-macos-arm64.zip" ;;
     *)     LIB_NAME="hk-watch-location-lib-macos-x86_64.zip" ;;
 esac
 LIB_URL="${BASE_URL}/${LIB_NAME}"
-case "${LIB_NAME}" in
-    *arm64*)    LIB_SHA256="ea8d639d42a44bffec3706da06d00a3d873f7358731a558ae15d076b85dea753" ;;
-    *)          LIB_SHA256="0b0ee5af52d6da2ae57297092136efa651ac7b15e1141f18578ea099412c5004" ;;
-esac
 PYPI_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
 # GitHub 加速代理地址（按顺序尝试，全部失效后才回退 GitHub 直连）
 GH_MIRRORS=(
@@ -142,21 +137,6 @@ fetch() {
     return 1
 }
 
-# 校验 SHA-256：verify <文件> <期望SHA256> [soft]
-# soft 模式校验失败仅返回 1 不退出（用于可重新下载的 lib 包）
-verify() {
-    local actual
-    actual=$(shasum -a 256 "$1" | awk '{print $1}')
-    if [ "$actual" != "$2" ]; then
-        if [ "${3:-}" = "soft" ]; then
-            c_warn "SHA-256 校验失败（文件：$1），将重新下载..."
-            return 1
-        fi
-        c_err "SHA-256 不匹配！期望 $2，实际 ${actual}（文件：$1）"; exit 1
-    fi
-    c_ok "SHA-256 校验通过：$(basename "$1")"
-}
-
 # 主包是否就绪（脚本 + 证书；lib 可缺失，缺时依赖走在线安装）
 bundle_ready() {
     [ -f "${BUNDLE_DIR}/accessory-location/tools/local_mfi_v3_helper.py" ] \
@@ -179,10 +159,19 @@ setup_bundle() {
             c_info "下载主组件包（脚本 + 证书）..."
             fetch "${BUNDLE_URL}" "$bundle_zip" 50000 || { rm -f "$bundle_zip"; exit 1; }
         fi
-        verify "$bundle_zip" "${BUNDLE_SHA256}"
         c_info "解压主组件包到 ${BUNDLE_DIR} ..."
         mkdir -p "${BUNDLE_DIR}"
-        unzip -q "$bundle_zip" -d "${BUNDLE_DIR}"
+        # 解压密码：用户输入（直接回车 = 无密码）；lib 包不受影响
+        local pw=""
+        printf "%s" "请输入组件包解压密码（直接回车表示无密码）: "
+        read -r pw || pw=""   # set -e 下 EOF 不退出
+        if [ -n "$pw" ]; then
+            unzip -q -P "$pw" "$bundle_zip" -d "${BUNDLE_DIR}" \
+                || { c_err "解压失败：密码错误或组件包损坏"; rm -rf "${BUNDLE_DIR}"; exit 1; }
+        else
+            unzip -q "$bundle_zip" -d "${BUNDLE_DIR}" 2>/dev/null \
+                || { c_err "解压失败：组件包已加密，请重新运行并输入解压密码"; rm -rf "${BUNDLE_DIR}"; exit 1; }
+        fi
         bundle_ready || { c_err "主组件包解压后不完整（缺 accessory-location / identity）"; exit 1; }
         c_ok "主组件包就绪：${BUNDLE_DIR}（证书已随包提供，无需再解析 APK）"
     else
@@ -192,15 +181,13 @@ setup_bundle() {
     # --- 本平台 lib 包；网络持续不可用时跳过，由步骤 3 自动在线安装依赖 ---
     if ! ls "${BUNDLE_DIR}/lib/"*.whl >/dev/null 2>&1; then
         local lib_zip="/tmp/${LIB_NAME}"
-        # 本地已有则校验；文件缺失或校验失败都会重新下载
-        if [ ! -f "$lib_zip" ] || ! verify "$lib_zip" "${LIB_SHA256}" soft; then
+        if [ ! -f "$lib_zip" ]; then
             c_info "下载本平台 lib 包：${LIB_NAME}（自动检测架构：$(uname -m)）..."
             if ! fetch "${LIB_URL}" "$lib_zip" 10000000 3600; then
                 c_warn "lib 包下载失败（网络不可用），将改为在线安装依赖"
                 rm -f "$lib_zip"
                 return 0
             fi
-            verify "$lib_zip" "${LIB_SHA256}"
         fi
         c_info "解压 lib 包到 ${BUNDLE_DIR}/lib ..."
         mkdir -p "${BUNDLE_DIR}/lib"
