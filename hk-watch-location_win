@@ -218,21 +218,10 @@ function Step-SetupBundle {
         }
         Write-Info "解压主组件包到 $BundleDir ..."
         New-Item $BundleDir -ItemType Directory -Force | Out-Null
-        # 解压密码：用户输入（直接回车 = 无密码）；lib 包不受影响
-        # Expand-Archive 不支持加密 zip：有密码时用 py + zipfile（ZipCrypto）
-        $pw = Read-Host "请输入组件包解压密码（直接回车表示无密码）"
-        if ($pw) {
-            $pyCode = "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2], pwd=sys.argv[3].encode())"
-            py -3 -c $pyCode $bundleZip $BundleDir $pw
-            if ($LASTEXITCODE -ne 0) {
-                Write-Err2 "解压失败：密码错误或组件包损坏"; Remove-Item $BundleDir -Recurse -Force -ErrorAction SilentlyContinue; exit 1
-            }
-        } else {
-            try { Expand-Archive -Path $bundleZip -DestinationPath $BundleDir -Force -ErrorAction Stop }
-            catch {
-                Write-Err2 "解压失败：组件包已加密，请重新运行并输入解压密码"
-                Remove-Item $BundleDir -Recurse -Force -ErrorAction SilentlyContinue; exit 1
-            }
+        try { Expand-Archive -Path $bundleZip -DestinationPath $BundleDir -Force -ErrorAction Stop }
+        catch {
+            Write-Err2 "解压失败：组件包损坏，请删除 $bundleZip 后重试"
+            Remove-Item $BundleDir -Recurse -Force -ErrorAction SilentlyContinue; exit 1
         }
         if (-not (Test-BundleReady)) {
             Write-Err2 "主组件包解压后不完整（缺 accessory-location / identity）"; exit 1

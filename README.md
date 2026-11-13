@@ -24,14 +24,10 @@ powershell -ExecutionPolicy Bypass -File .\hk-watch-location\hk-watch-location.p
 
 ## 组件包
 
-主包 `hk-watch-location-bundle.zip`（所有平台通用，**已加密，解压密码 `111`**）：
-
 | 目录 | 内容 |
 | --- | --- |
 | `accessory-location/` | iAP2 定位客户端源码、`tools/local_mfi_v3_helper.py` 等脚本 |
 | `identity/` | 共享实验性 MFi 身份（`certificate.p7b` / `identity.pk8`） |
-
-脚本下载后会提示输入解压密码（直接回车 = 按无密码解压，对加密包会失败并提示重新输入）。lib 平台包不加密。
 
 平台 lib 包（按 CPU 架构独立打包，脚本自动选择）
 
