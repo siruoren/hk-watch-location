@@ -68,6 +68,7 @@ function Invoke-Stop {
 # 返回 $true 表示端口 27015 已就绪；$false 表示需要用户手动处理
 function Install-AppleDevices {
     Write-Warn2 "未检测到 usbmuxd 服务，尝试自动安装 Apple Devices 应用..."
+    $iTunesOnly = $false
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
         # LTSC / 无 App Installer：自举安装 winget（GitHub release，主包走镜像链，依赖走微软官方直链）
         Write-Warn2 "winget 不可用（Windows 10 LTSC 无 App Installer），先自举安装 winget..."
@@ -92,10 +93,44 @@ function Install-AppleDevices {
         $env:Path = "$env:Path;$env:LOCALAPPDATA\Microsoft\WindowsApps"
         winget --version *> $null
         if ($LASTEXITCODE -ne 0) {
-            Write-Err2 "winget 自举安装未成功（LTSC 可能缺少 AppX 依赖或需重启），请手动安装 https://aka.ms/getwinget 后重试"
-            return $false
+            # winget 自举失败（LTSC 可能缺 AppX 依赖）：改用 Apple 官方 iTunes64Setup.exe
+            # （内含 Apple Mobile Device Service 即 usbmuxd；Apple CDN 支持直连，
+            #   直链来自 support.apple.com/kb/DL1816，Apple 已从官网主下载页移除 exe）
+            Write-Warn2 "winget 自举未成功，改用 Apple 官方 iTunes64Setup.exe 安装 usbmuxd..."
+            $installer = Join-Path $env:TEMP "iTunes64Setup.exe"
+            Write-Info "  下载 iTunes64Setup.exe（约 134MB，Apple CDN，带进度）..."
+            Remove-Item $installer -Force -ErrorAction SilentlyContinue
+            curl.exe -L --progress-bar --ssl-no-revoke --connect-timeout 15 --max-time 1800 --retry 3 --retry-delay 2 -o $installer "https://secure-appldnld.apple.com/itunes12/031-69284-20160802-7E7B2D20-552B-11E6-B2B9-696CECD541CE/iTunes64Setup.exe"
+            if (-not (Test-Path $installer) -or (Get-Item $installer).Length -lt 100000000) {
+                Write-Err2 "iTunes 安装包下载失败，请手动打开 https://support.apple.com/kb/DL1816 下载 iTunes64Setup.exe 安装后重试"
+                return $false
+            }
+            Write-Info "  静默安装 iTunes（InstallShield /S /v""/qn""，含 Apple Mobile Device Service）..."
+            $p = Start-Process -FilePath $installer -ArgumentList '/S','/v"/qn REBOOT=ReallySuppress"' -Wait -PassThru -ErrorAction SilentlyContinue
+            if (-not $p -or ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010)) {
+                Write-Warn2 "静默安装未成功，弹出安装向导，请点击完成安装..."
+                Start-Process -FilePath $installer -Wait -ErrorAction SilentlyContinue
+            }
+            Write-Ok "iTunes 安装完成（内含 usbmuxd）"
+            $iTunesOnly = $true   # usbmuxd 已就位，跳过 winget 安装，直接进入服务检查
+        } else {
+            Write-Ok "winget 自举完成：$((winget --version 2>$null | Out-String).Trim())"
         }
-        Write-Ok "winget 自举完成：$((winget --version 2>$null | Out-String).Trim())"
+    }
+
+    if (-not $iTunesOnly) {
+        # 渠道 1：winget 社区源（Apple 官网安装包，无需商店登录）
+        winget install --id Apple.AppleDevices -e --accept-package-agreements --accept-source-agreements
+        # 渠道 2：Microsoft Store 源（Apple Devices 应用 ID）
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn2 "官网渠道安装失败或已存在，改用 Microsoft Store 渠道..."
+            winget install --id 9NP83LWLPZ9S -e --source msstore --accept-package-agreements --accept-source-agreements
+            if ($LASTEXITCODE -ne 0) {
+                Write-Err2 "Apple Devices 自动安装失败，请手动安装后重试"
+                return $false
+            }
+        }
+        Write-Ok "Apple Devices 应用安装完成"
     }
 
     # 启动 Apple Mobile Device Service（usbmuxd）
@@ -131,7 +166,10 @@ function Step-CheckEnv {
     # uv 检查/安装
     if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
         Write-Warn2 "未安装 uv，正在安装..."
-        Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
+        # 安装脚本先落盘，再用 powershell -File 启动（避免 Invoke-Expression 的嵌套引号问题）
+        $uvSetup = Join-Path $env:TEMP "uv-install.ps1"
+        Invoke-RestMethod https://astral.sh/uv/install.ps1 -OutFile $uvSetup
+        powershell -NoProfile -ExecutionPolicy Bypass -File "$uvSetup"
         $env:Path = "$env:Path;$env:USERPROFILE\.local\bin"
     }
     if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
