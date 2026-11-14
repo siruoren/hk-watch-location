@@ -166,9 +166,9 @@ function Step-CheckEnv {
     # uv 检查/安装
     if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
         Write-Warn2 "未安装 uv，正在安装..."
-        # 安装脚本先落盘，再用 powershell -File 启动（避免 Invoke-Expression 的嵌套引号问题）
+        # uv 安装脚本：curl.exe 下载（带实时百分比进度），再用 powershell -File 启动（避免嵌套引号问题）
         $uvSetup = Join-Path $env:TEMP "uv-install.ps1"
-        Invoke-RestMethod https://astral.sh/uv/install.ps1 -OutFile $uvSetup
+        curl.exe -L --progress-bar --ssl-no-revoke --connect-timeout 15 --max-time 120 --retry 3 --retry-delay 2 -o "$uvSetup" "https://astral.sh/uv/install.ps1"
         powershell -NoProfile -ExecutionPolicy Bypass -File "$uvSetup"
         $env:Path = "$env:Path;$env:USERPROFILE\.local\bin"
     }

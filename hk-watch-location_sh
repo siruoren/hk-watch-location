@@ -109,11 +109,12 @@ check_env() {
 PROBE_TIMEOUT=10      # 代理测速限时（秒）
 PROBE_BYTES=262144    # 测速拉取的前缀字节数（256KB）
 
-# dl <URL> <目标文件> <最小字节数> <超时秒数>：带实时百分比进度下载（curl -# 进度条）
+# dl <URL> <目标文件> <最小字节数> <超时秒数>：带实时百分比进度下载
+# （curl -# 进度条直接写入终端 stderr，不加管道缓冲，保证前台实时显示百分比）
 dl() {
     rm -f "$2"
     curl -L --progress-bar --connect-timeout 15 --max-time "$4" --retry 3 --retry-delay 2 \
-         -o "$2" -H "User-Agent: hk-watch-location" "$1" 2>&1 | tr '\r' '\n' | tail -1
+         -o "$2" -H "User-Agent: hk-watch-location" "$1"
     [ -f "$2" ] && [ "$(stat -f%z "$2" 2>/dev/null || echo 0)" -gt "$3" ]
 }
 
