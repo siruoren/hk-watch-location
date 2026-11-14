@@ -69,22 +69,34 @@ function Invoke-Stop {
 function Install-AppleDevices {
     Write-Warn2 "未检测到 usbmuxd 服务，尝试自动安装 Apple Devices 应用..."
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Write-Err2 "winget 不可用（Windows 10 1809 以下或未安装 App Installer），无法自动安装"
-        return $false
-    }
-
-    # 渠道 1：winget 社区源（Apple 官网安装包，无需商店登录）
-    winget install --id Apple.AppleDevices -e --accept-package-agreements --accept-source-agreements
-    # 渠道 2：Microsoft Store 源（Apple Devices 应用 ID）
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warn2 "官网渠道安装失败或已存在，改用 Microsoft Store 渠道..."
-        winget install --id 9NP83LWLPZ9S -e --source msstore --accept-package-agreements --accept-source-agreements
+        # LTSC / 无 App Installer：自举安装 winget（GitHub release，主包走镜像链，依赖走微软官方直链）
+        Write-Warn2 "winget 不可用（Windows 10 LTSC 无 App Installer），先自举安装 winget..."
+        $tmp = $env:TEMP
+        $deps = @(
+            @{ Url = "https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx"; File = "VCLibs.appx" },
+            @{ Url = "https://ghfast.top/https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx"; File = "UIXaml.appx" },
+            @{ Url = "https://ghfast.top/https://github.com/microsoft/winget-cli/releases/latest/download/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"; File = "winget.msixbundle" }
+        )
+        foreach ($d in $deps) {
+            $f = Join-Path $tmp $d.File
+            Write-Info "  下载 $($d.File)（带进度）..."
+            Remove-Item $f -Force -ErrorAction SilentlyContinue
+            curl.exe -L --progress-bar --ssl-no-revoke --connect-timeout 15 --max-time 600 --retry 3 --retry-delay 2 -o $f $d.Url
+            if (-not (Test-Path $f) -or (Get-Item $f).Length -lt 100000) {
+                Write-Err2 "winget 依赖 $($d.File) 下载失败，请手动从 https://aka.ms/getwinget 安装 App Installer 后重试"
+                return $false
+            }
+            Write-Info "  安装 $($d.File) ..."
+            Add-AppxPackage -Path $f -ErrorAction SilentlyContinue
+        }
+        $env:Path = "$env:Path;$env:LOCALAPPDATA\Microsoft\WindowsApps"
+        winget --version *> $null
         if ($LASTEXITCODE -ne 0) {
-            Write-Err2 "Apple Devices 自动安装失败，请手动安装后重试"
+            Write-Err2 "winget 自举安装未成功（LTSC 可能缺少 AppX 依赖或需重启），请手动安装 https://aka.ms/getwinget 后重试"
             return $false
         }
+        Write-Ok "winget 自举完成：$((winget --version 2>$null | Out-String).Trim())"
     }
-    Write-Ok "Apple Devices 应用安装完成"
 
     # 启动 Apple Mobile Device Service（usbmuxd）
     Start-Sleep -Seconds 5
@@ -318,31 +330,49 @@ function Step-SetupDeps {
 
     $env:UV_PYTHON_INSTALL_MIRROR = "https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download"
     $venvExe = Join-Path $BundleDir ".venv\Scripts\accessory-location.exe"
+    $venvPy  = Join-Path $BundleDir ".venv\Scripts\python.exe"
     $venvDir = Join-Path $BundleDir ".venv"
 
-    if (-not (Test-Path $venvExe)) {
-        if (Test-Path $venvDir) { Remove-Item $venvDir -Recurse -Force }
-        uv venv --python 3.12 $venvDir
-        if (Test-LibReady) {
-            # 优先纯离线安装（lib\ 内含本平台全部 wheel）
-            uv pip install --python $venvDir --no-index `
-                --find-links (Join-Path $BundleDir "lib") accessory-location==0.1.0
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warn2 "离线安装失败，改用镜像在线补齐缺失组件..."
+    # venv 健康检查：入口缺失或核心导入失败视为残缺（上次运行被中断），清理重建
+    $healthy = $false
+    if ((Test-Path $venvExe) -and (Test-Path $venvPy)) {
+        & $venvPy -c "import cryptography, pymobiledevice3" 2>$null
+        if ($LASTEXITCODE -eq 0) { $healthy = $true; Write-Ok "依赖已就绪（导入验证通过）" }
+    }
+    if (-not $healthy) {
+        if (Test-Path $venvDir) {
+            Write-Warn2 "现有 .venv 残缺（可能是上次运行被中断），清理后重建..."
+            Remove-Item $venvDir -Recurse -Force
+        }
+        for ($vtry = 1; $vtry -le 2; $vtry++) {
+            uv venv --python 3.12 $venvDir
+            if (Test-LibReady) {
+                # 优先纯离线安装（lib\ 内含本平台全部 wheel）
+                uv pip install --python $venvDir --no-index `
+                    --find-links (Join-Path $BundleDir "lib") accessory-location==0.1.0
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warn2 "离线安装失败，改用镜像在线补齐缺失组件..."
+                    $env:UV_HTTP_TIMEOUT = "600"
+                    $env:UV_INDEX_URL    = $PyPiMirror
+                    uv pip install --python $venvDir (Join-Path $BundleDir "accessory-location")
+                }
+            } else {
+                # lib 包未下载成功（网络不可用）：直接在线安装（包内源码 + 镜像拉依赖）
+                Write-Warn2 "lib\ 无 wheel，改为在线安装依赖（使用清华镜像）..."
                 $env:UV_HTTP_TIMEOUT = "600"
                 $env:UV_INDEX_URL    = $PyPiMirror
                 uv pip install --python $venvDir (Join-Path $BundleDir "accessory-location")
             }
-        } else {
-            # lib 包未下载成功（网络不可用）：直接在线安装（包内源码 + 镜像拉依赖）
-            Write-Warn2 "lib\ 无 wheel，改为在线安装依赖（使用清华镜像）..."
-            $env:UV_HTTP_TIMEOUT = "600"
-            $env:UV_INDEX_URL    = $PyPiMirror
-            uv pip install --python $venvDir (Join-Path $BundleDir "accessory-location")
+            & $venvPy -c "import cryptography, pymobiledevice3" 2>$null
+            if ($LASTEXITCODE -eq 0) { break }
+            Remove-Item $venvDir -Recurse -Force -ErrorAction SilentlyContinue
+            if ($vtry -lt 2) { Write-Warn2 "安装后验证未通过（venv 可能仍残缺），已清理重试..." }
         }
     }
-    & (Join-Path $BundleDir ".venv\Scripts\python.exe") -c "import cryptography, pymobiledevice3"
-    if ($LASTEXITCODE -eq 0) { Write-Ok "依赖安装并导入验证通过" }
+    if (Test-Path $venvPy) {
+        & $venvPy -c "import cryptography, pymobiledevice3"
+        if ($LASTEXITCODE -eq 0) { Write-Ok "依赖安装并导入验证通过" }
+    }
 }
 
 # ========================= 步骤 4：发送坐标 =========================

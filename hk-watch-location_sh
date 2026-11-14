@@ -254,25 +254,47 @@ setup_deps() {
 
     export UV_PYTHON_INSTALL_MIRROR="${GH_MIRRORS[0]}https://github.com/astral-sh/python-build-standalone/releases/download"
 
-    if [ ! -x "${BUNDLE_DIR}/.venv/bin/accessory-location" ]; then
-        rm -rf "${BUNDLE_DIR}/.venv"
-        uv venv --python 3.12 "${BUNDLE_DIR}/.venv"
-        if ls "${BUNDLE_DIR}/lib/"*.whl >/dev/null 2>&1; then
-            # 优先纯离线安装（lib/ 内含本平台全部 wheel）
-            if ! uv pip install --python "${BUNDLE_DIR}/.venv" --no-index \
-                 --find-links "${BUNDLE_DIR}/lib" accessory-location==0.1.0; then
-                c_warn "离线安装失败，改用镜像在线补齐缺失组件..."
-                UV_HTTP_TIMEOUT=600 UV_INDEX_URL="${PYPI_MIRROR}" \
-                    uv pip install --python "${BUNDLE_DIR}/.venv" \
-                    "${BUNDLE_DIR}/accessory-location"
-            fi
-        else
-            # lib 包未下载成功（网络不可用）：直接在线安装（包内源码 + 镜像拉依赖）
-            c_warn "lib/ 无 wheel，改为在线安装依赖（使用清华镜像）..."
-            UV_HTTP_TIMEOUT=600 UV_INDEX_URL="${PYPI_MIRROR}" \
-                uv pip install --python "${BUNDLE_DIR}/.venv" \
-                "${BUNDLE_DIR}/accessory-location"
+    # venv 健康检查：入口缺失或核心导入失败视为残缺（上次运行被中断），清理重建
+    local healthy=0
+    if [ -x "${BUNDLE_DIR}/.venv/bin/accessory-location" ] \
+        && "${BUNDLE_DIR}/.venv/bin/python" -c "import cryptography, pymobiledevice3" >/dev/null 2>&1; then
+        healthy=1
+        c_ok "依赖已就绪（导入验证通过）"
+    fi
+    if [ "$healthy" -eq 0 ]; then
+        if [ -d "${BUNDLE_DIR}/.venv" ]; then
+            c_warn "现有 .venv 残缺（可能是上次运行被中断），清理后重建..."
+            rm -rf "${BUNDLE_DIR}/.venv"
         fi
+        local vtry
+        for vtry in 1 2; do
+            uv venv --python 3.12 "${BUNDLE_DIR}/.venv"
+            if ls "${BUNDLE_DIR}/lib/"*.whl >/dev/null 2>&1; then
+                # 优先纯离线安装（lib/ 内含本平台全部 wheel）
+                if ! uv pip install --python "${BUNDLE_DIR}/.venv" --no-index \
+                     --find-links "${BUNDLE_DIR}/lib" accessory-location==0.1.0; then
+                    c_warn "离线安装失败，改用镜像在线补齐缺失组件..."
+                    if ! UV_HTTP_TIMEOUT=600 UV_INDEX_URL="${PYPI_MIRROR}" \
+                            uv pip install --python "${BUNDLE_DIR}/.venv" \
+                            "${BUNDLE_DIR}/accessory-location"; then
+                        c_warn "在线安装也失败，将清理 venv 后重试..."
+                    fi
+                fi
+            else
+                # lib 包未下载成功（网络不可用）：直接在线安装（包内源码 + 镜像拉依赖）
+                c_warn "lib/ 无 wheel，改为在线安装依赖（使用清华镜像）..."
+                if ! UV_HTTP_TIMEOUT=600 UV_INDEX_URL="${PYPI_MIRROR}" \
+                        uv pip install --python "${BUNDLE_DIR}/.venv" \
+                        "${BUNDLE_DIR}/accessory-location"; then
+                    c_warn "在线安装失败，将清理 venv 后重试..."
+                fi
+            fi
+            if "${BUNDLE_DIR}/.venv/bin/python" -c "import cryptography, pymobiledevice3" >/dev/null 2>&1; then
+                break
+            fi
+            rm -rf "${BUNDLE_DIR}/.venv"
+            [ "$vtry" -lt 2 ] && c_warn "安装后验证未通过（venv 可能仍残缺），已清理重试..."
+        done
     fi
     "${BUNDLE_DIR}/.venv/bin/python" -c "import cryptography, pymobiledevice3" \
         && c_ok "依赖安装并导入验证通过"
