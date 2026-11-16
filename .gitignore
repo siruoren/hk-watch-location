@@ -2,4 +2,4 @@ accessory-location/**
 lib/**
 **.zip
 identity/**
-.DS_Store
+**/.DS_Store
