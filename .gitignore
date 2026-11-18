@@ -3,3 +3,7 @@ lib/**
 **.zip
 identity/**
 **/.DS_Store
+**.appx
+**.tar.gz
+**.msixbundle
+**.exe
